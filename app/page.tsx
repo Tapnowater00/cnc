@@ -44,10 +44,10 @@ export default function Home() {
 
         {/* Right — terminal + CAM */}
         <aside className="w-80 flex-shrink-0 flex flex-col border-l border-zinc-800 overflow-hidden">
-          <div className="flex-1 min-h-0 p-3">
+          <div className="flex-[2] min-h-0 p-3">
             <Terminal />
           </div>
-          <div className="border-t border-zinc-800 p-3 overflow-y-auto max-h-[55%]">
+          <div className="flex-[3] min-h-0 border-t border-zinc-800 flex flex-col">
             <CamPanel />
           </div>
         </aside>
