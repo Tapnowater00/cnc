@@ -23,6 +23,7 @@ interface CanvasStore {
   materialH: number
   materialDepth: number
   toolpath: PathSegment[] | null
+  toolpathBitDia: number   // bit diameter used for last toolpath (for simulation)
   view: '2d' | '3d'
 
   setTool: (tool: Tool) => void
@@ -31,7 +32,7 @@ interface CanvasStore {
   updateShape: (id: string, updates: Partial<Omit<CanvasShape, 'id'>>) => void
   deleteSelected: () => void
   selectShape: (id: string | null) => void
-  setToolpath: (segs: PathSegment[] | null) => void
+  setToolpath: (segs: PathSegment[] | null, bitDia?: number) => void
   setView: (v: '2d' | '3d') => void
 }
 
@@ -43,6 +44,7 @@ export const useCanvasStore = create<CanvasStore>((set, get) => ({
   materialH: 200,
   materialDepth: 18,
   toolpath: null,
+  toolpathBitDia: 6,
   view: '2d',
 
   setTool: (tool) => set({ tool }),
@@ -57,6 +59,7 @@ export const useCanvasStore = create<CanvasStore>((set, get) => ({
     set((s) => ({ shapes: s.shapes.filter((sh) => sh.id !== selectedId), selectedId: null }))
   },
   selectShape: (selectedId) => set({ selectedId }),
-  setToolpath: (toolpath) => set({ toolpath }),
+  setToolpath: (toolpath, bitDia) =>
+    set((s) => ({ toolpath, toolpathBitDia: bitDia ?? s.toolpathBitDia })),
   setView: (view) => set({ view }),
 }))

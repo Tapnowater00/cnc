@@ -69,7 +69,8 @@ export default function CamPanel() {
     }
 
     setGenerated(lines)
-    setToolpath(parseToolpathXYZ(lines))
+    const simBitDia = mode === 'vcarve' ? 0.5 : bitDia
+    setToolpath(parseToolpathXYZ(lines), simBitDia)
   }
 
   const loadToSender = () => {
