@@ -3,6 +3,47 @@ import type { PathSegment } from '@/lib/cam/parsePath'
 
 export type ShapeType = 'rect' | 'circle' | 'line'
 export type Tool = 'select' | 'rect' | 'circle' | 'line'
+export type CutType = 'outside' | 'inside' | 'on-line'
+export type CutMode = 'profile' | 'pocket' | 'drill' | 'vcarve'
+export type PocketStrategy = 'lines' | 'contour'
+
+export interface ShapeCutSettings {
+  mode: CutMode
+  cutType: CutType
+  pocketStrat: PocketStrategy
+  vAngle: number
+  dwell: number
+  bitDia: number
+  depth: number
+  passDepth: number
+  feedRate: number
+  plungeRate: number
+  spindleRPM: number
+  stepoverPct: number
+  tabsOn: boolean
+  tabCount: number
+  tabWidth: number
+  tabHeight: number
+}
+
+export const DEFAULT_CUT_SETTINGS: ShapeCutSettings = {
+  mode: 'profile',
+  cutType: 'outside',
+  pocketStrat: 'lines',
+  vAngle: 60,
+  dwell: 0,
+  bitDia: 6,
+  depth: 10,
+  passDepth: 2,
+  feedRate: 1000,
+  plungeRate: 200,
+  spindleRPM: 18000,
+  stepoverPct: 40,
+  tabsOn: false,
+  tabCount: 4,
+  tabWidth: 8,
+  tabHeight: 3,
+}
 
 export interface CanvasShape {
   id: string
@@ -13,6 +54,7 @@ export interface CanvasShape {
   height: number
   points?: number[]  // flat [x0,y0,x1,y1,...] in mm — only for type='line'
   closed?: boolean   // close the polyline back to the first point
+  cutSettings?: ShapeCutSettings
 }
 
 interface CanvasStore {

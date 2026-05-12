@@ -1,7 +1,7 @@
-import type { CanvasShape } from '@/lib/canvas/store'
+import type { CanvasShape, CutType } from '@/lib/canvas/store'
 import { movesWithTabs, type TabSettings } from './tabs'
 
-export type CutType = 'outside' | 'inside' | 'on-line'
+export type { CutType }
 
 export interface ProfileParams {
   shape: CanvasShape

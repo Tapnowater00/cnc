@@ -1,43 +1,31 @@
 'use client'
 
 import { useState } from 'react'
-import { useCanvasStore } from '@/lib/canvas/store'
-import { generateProfile, type CutType } from '@/lib/cam/profile'
+import { useCanvasStore, DEFAULT_CUT_SETTINGS } from '@/lib/canvas/store'
+import type { ShapeCutSettings, CutType, CutMode, PocketStrategy } from '@/lib/canvas/store'
+import { generateProfile } from '@/lib/cam/profile'
 import { generatePocket }  from '@/lib/cam/pocket'
 import { generateDrill }   from '@/lib/cam/drill'
 import { generateVCarve }  from '@/lib/cam/vcarve'
 import { parseToolpathXYZ } from '@/lib/cam/parsePath'
 import { useGrblStore } from '@/lib/grbl/store'
 
-type Mode = 'profile' | 'pocket' | 'drill' | 'vcarve'
-type PocketStrategy = 'lines' | 'contour'
-
 const V_ANGLES = [30, 45, 60, 90, 120] as const
 
 export default function CamPanel() {
-  const { shapes, selectedId, setToolpath } = useCanvasStore()
+  const { shapes, selectedId, updateShape, setToolpath } = useCanvasStore()
   const selected = shapes.find(s => s.id === selectedId)
   const isLine = selected?.type === 'line'
 
-  const [mode, setMode]               = useState<Mode>('profile')
-  const [cutType, setCutType]         = useState<CutType>('outside')
-  const [pocketStrat, setPocketStrat] = useState<PocketStrategy>('lines')
-  const [tabsOn, setTabsOn]           = useState(false)
-  const [tabCount, setTabCount]       = useState(4)
-  const [tabWidth, setTabWidth]       = useState(8)
-  const [tabHeight, setTabHeight]     = useState(3)
-  const [vAngle, setVAngle]           = useState(60)
-  const [dwell, setDwell]             = useState(0)
-  const [bitDia, setBitDia]           = useState(6)
-  const [depth, setDepth]             = useState(10)
-  const [passDepth, setPassDepth]     = useState(2)
-  const [feedRate, setFeedRate]       = useState(1000)
-  const [plungeRate, setPlungeRate]   = useState(200)
-  const [spindleRPM, setSpindleRPM]   = useState(18000)
-  const [stepoverPct, setStepoverPct] = useState(40)
-  const [generated, setGenerated]     = useState<string[] | null>(null)
+  // Per-shape gcode preview state (not persisted — regenerate to refresh)
+  const [generated, setGenerated] = useState<string[] | null>(null)
+  const [lastShapeId, setLastShapeId] = useState<string | null>(null)
 
-  const dirty = () => setGenerated(null)
+  // Clear preview when selection changes
+  if (selected?.id !== lastShapeId) {
+    setLastShapeId(selected?.id ?? null)
+    if (generated !== null) setGenerated(null)
+  }
 
   // ── No shape selected ─────────────────────────────────────────
   if (!selected) {
@@ -52,37 +40,53 @@ export default function CamPanel() {
     )
   }
 
+  // Per-shape settings, falling back to defaults
+  const cs: ShapeCutSettings = selected.cutSettings ?? DEFAULT_CUT_SETTINGS
+
+  const update = (patch: Partial<ShapeCutSettings>) => {
+    updateShape(selected.id, { cutSettings: { ...cs, ...patch } })
+    setGenerated(null)
+  }
+
   // ── Generate ──────────────────────────────────────────────────
   const generate = () => {
-    const common = { bitDiameter: bitDia, depth, passDepth, feedRate, plungeRate, spindleRPM, safeZ: 5 }
-    const tabs = tabsOn ? { count: tabCount, width: tabWidth, height: tabHeight } : undefined
+    const common = {
+      bitDiameter: cs.bitDia,
+      depth: cs.depth,
+      passDepth: cs.passDepth,
+      feedRate: cs.feedRate,
+      plungeRate: cs.plungeRate,
+      spindleRPM: cs.spindleRPM,
+      safeZ: 5,
+    }
+    const tabs = cs.tabsOn ? { count: cs.tabCount, width: cs.tabWidth, height: cs.tabHeight } : undefined
     let lines: string[]
 
-    if (isLine || mode === 'profile') {
-      lines = generateProfile({ shape: selected, cutType: isLine ? 'on-line' : cutType, ...common, tabs })
-    } else if (mode === 'pocket') {
-      lines = generatePocket({ shape: selected, stepoverPct: stepoverPct / 100, strategy: pocketStrat, ...common })
-    } else if (mode === 'drill') {
-      lines = generateDrill({ shape: selected, depth, passDepth, plungeRate, spindleRPM, safeZ: 5, dwell })
+    if (isLine || cs.mode === 'profile') {
+      lines = generateProfile({ shape: selected, cutType: isLine ? 'on-line' : cs.cutType, ...common, tabs })
+    } else if (cs.mode === 'pocket') {
+      lines = generatePocket({ shape: selected, stepoverPct: cs.stepoverPct / 100, strategy: cs.pocketStrat, ...common })
+    } else if (cs.mode === 'drill') {
+      lines = generateDrill({ shape: selected, depth: cs.depth, passDepth: cs.passDepth, plungeRate: cs.plungeRate, spindleRPM: cs.spindleRPM, safeZ: 5, dwell: cs.dwell })
     } else {
-      lines = generateVCarve({ shape: selected, vAngle, maxDepth: depth, feedRate, plungeRate, spindleRPM, safeZ: 5 })
+      lines = generateVCarve({ shape: selected, vAngle: cs.vAngle, maxDepth: cs.depth, feedRate: cs.feedRate, plungeRate: cs.plungeRate, spindleRPM: cs.spindleRPM, safeZ: 5 })
     }
 
     setGenerated(lines)
-    const simBitDia = mode === 'vcarve' ? 0.5 : bitDia
+    const simBitDia = cs.mode === 'vcarve' ? 0.5 : cs.bitDia
     setToolpath(parseToolpathXYZ(lines), simBitDia)
   }
 
   const loadToSender = () => {
     if (!generated) return
-    const suffix = isLine ? 'line' : mode === 'profile' ? cutType : mode
+    const suffix = isLine ? 'line' : cs.mode === 'profile' ? cs.cutType : cs.mode
     const blob = new Blob([generated.join('\n')], { type: 'text/plain' })
     useGrblStore.getState().loadFile(new File([blob], `${selected.type}-${suffix}.gcode`))
   }
 
   const isError   = generated?.[0]?.startsWith('; ERROR')
   const moveCount = generated?.filter(l => !l.startsWith(';')).length ?? 0
-  const numPasses = mode === 'vcarve' ? 1 : Math.ceil(depth / passDepth)
+  const numPasses = cs.mode === 'vcarve' ? 1 : Math.ceil(cs.depth / cs.passDepth)
 
   // ── Shape selected ────────────────────────────────────────────
   return (
@@ -111,9 +115,9 @@ export default function CamPanel() {
           <p className="text-xs text-zinc-500 italic">On-line cut · bit follows the path</p>
         ) : (
           <div className="grid grid-cols-4 gap-1">
-            {(['profile', 'pocket', 'drill', 'vcarve'] as Mode[]).map(m => (
-              <button key={m} onClick={() => { setMode(m); dirty() }}
-                className={`py-1.5 text-xs rounded transition-colors ${mode === m ? 'bg-cyan-600 text-white' : 'bg-zinc-700 text-zinc-300 hover:bg-zinc-600'}`}>
+            {(['profile', 'pocket', 'drill', 'vcarve'] as CutMode[]).map(m => (
+              <button key={m} onClick={() => update({ mode: m })}
+                className={`py-1.5 text-xs rounded transition-colors ${cs.mode === m ? 'bg-cyan-600 text-white' : 'bg-zinc-700 text-zinc-300 hover:bg-zinc-600'}`}>
                 {m === 'vcarve' ? 'V-Carve' : m[0].toUpperCase() + m.slice(1)}
               </button>
             ))}
@@ -121,11 +125,11 @@ export default function CamPanel() {
         )}
 
         {/* Profile cut type */}
-        {!isLine && mode === 'profile' && (
+        {!isLine && cs.mode === 'profile' && (
           <div className="flex gap-1">
             {([['outside','Outside'],['on-line','On-line'],['inside','Inside']] as [CutType,string][]).map(([id,label]) => (
-              <button key={id} onClick={() => { setCutType(id); dirty() }}
-                className={`flex-1 py-1 text-xs rounded transition-colors ${cutType === id ? 'bg-cyan-700 text-white' : 'bg-zinc-700 text-zinc-300 hover:bg-zinc-600'}`}>
+              <button key={id} onClick={() => update({ cutType: id })}
+                className={`flex-1 py-1 text-xs rounded transition-colors ${cs.cutType === id ? 'bg-cyan-700 text-white' : 'bg-zinc-700 text-zinc-300 hover:bg-zinc-600'}`}>
                 {label}
               </button>
             ))}
@@ -133,11 +137,11 @@ export default function CamPanel() {
         )}
 
         {/* Pocket strategy */}
-        {!isLine && mode === 'pocket' && (
+        {!isLine && cs.mode === 'pocket' && (
           <div className="flex gap-1">
             {([['lines','Zigzag'],['contour','Contour']] as [PocketStrategy,string][]).map(([id,label]) => (
-              <button key={id} onClick={() => { setPocketStrat(id); dirty() }}
-                className={`flex-1 py-1 text-xs rounded transition-colors ${pocketStrat === id ? 'bg-cyan-700 text-white' : 'bg-zinc-700 text-zinc-300 hover:bg-zinc-600'}`}>
+              <button key={id} onClick={() => update({ pocketStrat: id })}
+                className={`flex-1 py-1 text-xs rounded transition-colors ${cs.pocketStrat === id ? 'bg-cyan-700 text-white' : 'bg-zinc-700 text-zinc-300 hover:bg-zinc-600'}`}>
                 {label}
               </button>
             ))}
@@ -145,66 +149,66 @@ export default function CamPanel() {
         )}
 
         {/* V-carve angle */}
-        {!isLine && mode === 'vcarve' && (
+        {!isLine && cs.mode === 'vcarve' && (
           <div className="space-y-1">
             <div className="flex items-center justify-between gap-2">
               <span className="text-xs text-zinc-500">V angle</span>
               <div className="flex gap-1">
                 {V_ANGLES.map(a => (
-                  <button key={a} onClick={() => { setVAngle(a); dirty() }}
-                    className={`px-1.5 py-0.5 text-xs rounded transition-colors ${vAngle === a ? 'bg-cyan-700 text-white' : 'bg-zinc-700 text-zinc-400 hover:bg-zinc-600'}`}>
+                  <button key={a} onClick={() => update({ vAngle: a })}
+                    className={`px-1.5 py-0.5 text-xs rounded transition-colors ${cs.vAngle === a ? 'bg-cyan-700 text-white' : 'bg-zinc-700 text-zinc-400 hover:bg-zinc-600'}`}>
                     {a}°
                   </button>
                 ))}
               </div>
             </div>
             <p className="text-xs text-zinc-600">
-              Width at {depth}mm: {(2 * depth * Math.tan((vAngle / 2) * Math.PI / 180)).toFixed(2)}mm
+              Width at {cs.depth}mm: {(2 * cs.depth * Math.tan((cs.vAngle / 2) * Math.PI / 180)).toFixed(2)}mm
             </p>
           </div>
         )}
 
         {/* Params */}
         <div className="space-y-1.5">
-          {mode !== 'vcarve' && (
-            <Row label="Bit dia (mm)"    value={bitDia}     onChange={v=>{setBitDia(v);dirty()}}     step={0.5}  min={0.1} />
+          {cs.mode !== 'vcarve' && (
+            <Row label="Bit dia (mm)"    value={cs.bitDia}      onChange={v => update({ bitDia: v })}      step={0.5}  min={0.1} />
           )}
-          <Row label="Depth (mm)"        value={depth}      onChange={v=>{setDepth(v);dirty()}}      step={0.5}  min={0.1} />
-          {mode !== 'vcarve' && (
-            <Row label={mode==='drill'?"Peck depth (mm)":"Pass depth (mm)"} value={passDepth} onChange={v=>{setPassDepth(v);dirty()}} step={0.5} min={0.1} />
+          <Row label="Depth (mm)"        value={cs.depth}       onChange={v => update({ depth: v })}       step={0.5}  min={0.1} />
+          {cs.mode !== 'vcarve' && (
+            <Row label={cs.mode === 'drill' ? 'Peck depth (mm)' : 'Pass depth (mm)'} value={cs.passDepth} onChange={v => update({ passDepth: v })} step={0.5} min={0.1} />
           )}
-          {mode !== 'drill' && (
-            <Row label="Feed (mm/min)"   value={feedRate}   onChange={v=>{setFeedRate(v);dirty()}}   step={100}  min={10}  />
+          {cs.mode !== 'drill' && (
+            <Row label="Feed (mm/min)"   value={cs.feedRate}    onChange={v => update({ feedRate: v })}    step={100}  min={10}  />
           )}
-          <Row label="Plunge (mm/min)"   value={plungeRate} onChange={v=>{setPlungeRate(v);dirty()}} step={50}   min={10}  />
-          <Row label="Spindle (RPM)"     value={spindleRPM} onChange={v=>{setSpindleRPM(v);dirty()}} step={1000} min={100} />
-          {mode === 'pocket' && (
-            <Row label="Stepover (%)"    value={stepoverPct} onChange={v=>{setStepoverPct(v);dirty()}} step={5} min={10} />
+          <Row label="Plunge (mm/min)"   value={cs.plungeRate}  onChange={v => update({ plungeRate: v })}  step={50}   min={10}  />
+          <Row label="Spindle (RPM)"     value={cs.spindleRPM}  onChange={v => update({ spindleRPM: v })}  step={1000} min={100} />
+          {cs.mode === 'pocket' && (
+            <Row label="Stepover (%)"    value={cs.stepoverPct} onChange={v => update({ stepoverPct: v })} step={5}    min={10}  />
           )}
-          {mode === 'drill' && (
-            <Row label="Dwell (s)"       value={dwell}      onChange={v=>{setDwell(v);dirty()}}      step={0.5}  min={0}   />
+          {cs.mode === 'drill' && (
+            <Row label="Dwell (s)"       value={cs.dwell}       onChange={v => update({ dwell: v })}       step={0.5}  min={0}   />
           )}
         </div>
 
         {/* Holding tabs */}
-        {(isLine || mode === 'profile') && (
+        {(isLine || cs.mode === 'profile') && (
           <div className="border border-zinc-700 rounded p-2 space-y-1.5">
             <label className="flex items-center gap-2 cursor-pointer">
-              <input type="checkbox" checked={tabsOn} onChange={e=>{setTabsOn(e.target.checked);dirty()}} className="accent-cyan-500" />
+              <input type="checkbox" checked={cs.tabsOn} onChange={e => update({ tabsOn: e.target.checked })} className="accent-cyan-500" />
               <span className="text-xs text-zinc-400 font-medium">Holding Tabs</span>
             </label>
-            {tabsOn && (
+            {cs.tabsOn && (
               <>
-                <Row label="Count"      value={tabCount}  onChange={v=>{setTabCount(Math.round(v));dirty()}} step={1}   min={1}   />
-                <Row label="Width (mm)" value={tabWidth}  onChange={v=>{setTabWidth(v);dirty()}}             step={1}   min={1}   />
-                <Row label="Height(mm)" value={tabHeight} onChange={v=>{setTabHeight(v);dirty()}}            step={0.5} min={0.5} />
+                <Row label="Count"      value={cs.tabCount}  onChange={v => update({ tabCount: Math.round(v) })} step={1}   min={1}   />
+                <Row label="Width (mm)" value={cs.tabWidth}  onChange={v => update({ tabWidth: v })}              step={1}   min={1}   />
+                <Row label="Height(mm)" value={cs.tabHeight} onChange={v => update({ tabHeight: v })}             step={0.5} min={0.5} />
               </>
             )}
           </div>
         )}
 
         <p className="text-xs text-zinc-600">
-          {mode === 'vcarve' ? '1 pass · single depth' : `${numPasses} pass${numPasses !== 1 ? 'es' : ''} · safe Z 5mm`}
+          {cs.mode === 'vcarve' ? '1 pass · single depth' : `${numPasses} pass${numPasses !== 1 ? 'es' : ''} · safe Z 5mm`}
         </p>
 
       </div>
