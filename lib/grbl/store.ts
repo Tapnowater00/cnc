@@ -25,8 +25,12 @@ export interface JobState {
 }
 
 interface GrblStore {
-  // Connection
-  port: SerialPort | null
+  // WebSocket to the Pi bridge
+  wsReady: boolean
+  availablePorts: string[]
+  selectedPort: string
+
+  // Serial connection
   connected: boolean
   connecting: boolean
 
@@ -45,13 +49,16 @@ interface GrblStore {
   job: JobState | null
 
   // Actions
-  connect: (baudRate?: number) => Promise<void>
-  disconnect: () => Promise<void>
-  send: (cmd: string) => Promise<void>
+  initWs: () => void
+  listPorts: () => void
+  setSelectedPort: (port: string) => void
+  connect: (baudRate?: number) => void
+  disconnect: () => void
+  send: (cmd: string) => void
   clearLog: () => void
-  home: () => Promise<void>
-  reset: () => Promise<void>
-  unlock: () => Promise<void>
+  home: () => void
+  reset: () => void
+  unlock: () => void
 
   // Job actions
   loadFile: (file: File) => Promise<void>
@@ -61,7 +68,7 @@ interface GrblStore {
   stopJob: () => void
 
   // Probe actions
-  probeZ: (plateThickness: number, feedRate: number, maxDistance: number) => Promise<void>
+  probeZ: (plateThickness: number, feedRate: number, maxDistance: number) => void
 
   // Spindle + override actions
   spindleOverride: (byte: number) => void
@@ -69,11 +76,10 @@ interface GrblStore {
 }
 
 let logId = 0
-let writer: WritableStreamDefaultWriter<Uint8Array> | null = null
+let ws: WebSocket | null = null
 let statusInterval: ReturnType<typeof setInterval> | null = null
-let readLoopActive = false
 
-// Job streaming state (module-level for read loop access)
+// Job streaming state
 let jobLines: string[] = []
 let jobIndex = 0
 let jobActive = false
@@ -83,12 +89,26 @@ let waitingForOk = false
 // Accumulated firmware info from [VER] + [OPT]
 let pendingFirmware: Partial<FirmwareInfo> = {}
 
-// Post-probe state: set when [PRB:] success received, cleared on next ok
+// Post-probe state
 let pendingProbeZero = false
 let pendingPlateThickness = 15
 
+function rawSend(text: string) {
+  if (ws?.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'send', text }))
+  }
+}
+
+function rawBytes(data: number[]) {
+  if (ws?.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'bytes', data }))
+  }
+}
+
 export const useGrblStore = create<GrblStore>((set, get) => ({
-  port: null,
+  wsReady: false,
+  availablePorts: [],
+  selectedPort: '',
   connected: false,
   connecting: false,
   status: null,
@@ -100,75 +120,92 @@ export const useGrblStore = create<GrblStore>((set, get) => ({
   log: [],
   job: null,
 
-  connect: async (baudRate = 115200) => {
-    set({ connecting: true })
-    try {
-      const port = await (navigator as any).serial.requestPort()
-      await port.open({ baudRate })
+  initWs: () => {
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return
+    const proto = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    const host = typeof window !== 'undefined' ? window.location.host : 'localhost:3000'
+    ws = new WebSocket(`${proto}//${host}/ws`)
 
-      writer = port.writable.getWriter()
-      readLoopActive = true
-      pendingFirmware = {}
-      startReadLoop(port, set, get)
+    ws.onopen = () => {
+      set({ wsReady: true })
+      get().listPorts()
+    }
 
-      statusInterval = setInterval(() => {
-        get().send('?')
-      }, 200)
+    ws.onclose = () => {
+      set({ wsReady: false })
+      if (get().connected) {
+        addLog(set, 'error', 'Bridge connection lost')
+        if (statusInterval) clearInterval(statusInterval)
+        set({ connected: false, status: null, job: null })
+      }
+    }
 
-      addLog(set, 'info', 'Connected')
-      set({ port, connected: true, connecting: false, firmware: null })
+    ws.onerror = () => {
+      addLog(set, 'error', 'WebSocket error — is the server running?')
+    }
 
-      // Wake up then request firmware info
-      setTimeout(() => {
-        get().send('\r\n\r\n')
-        setTimeout(() => get().send('$I'), 500)
-      }, 300)
-    } catch (err: any) {
-      addLog(set, 'error', `Connection failed: ${err.message}`)
-      set({ connecting: false })
+    ws.onmessage = (event: MessageEvent) => {
+      let msg: { type: string; ports?: string[]; text?: string; message?: string }
+      try {
+        msg = JSON.parse(event.data)
+      } catch {
+        return
+      }
+      handleMessage(msg, set, get)
     }
   },
 
-  disconnect: async () => {
-    readLoopActive = false
+  listPorts: () => {
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'ports' }))
+    }
+  },
+
+  setSelectedPort: (port: string) => set({ selectedPort: port }),
+
+  connect: (baudRate = 115200) => {
+    const { selectedPort, wsReady, initWs } = get()
+    if (!wsReady) {
+      initWs()
+      return
+    }
+    if (!selectedPort) {
+      addLog(set, 'error', 'No port selected')
+      return
+    }
+    set({ connecting: true })
+    ws?.send(JSON.stringify({ type: 'connect', port: selectedPort, baudRate }))
+  },
+
+  disconnect: () => {
     jobActive = false
     if (statusInterval) clearInterval(statusInterval)
-    if (writer) { writer.releaseLock(); writer = null }
-    const { port } = get()
-    if (port) {
-      try { await port.close() } catch {}
-    }
+    ws?.send(JSON.stringify({ type: 'disconnect' }))
     addLog(set, 'info', 'Disconnected')
-    set({ port: null, connected: false, status: null, job: null, firmware: null, gcodeState: null, probeResult: null, probing: false })
+    set({ connected: false, status: null, job: null, firmware: null, gcodeState: null, probeResult: null, probing: false })
   },
 
-  send: async (cmd: string) => {
-    if (!writer) return
-    // Real-time commands must NOT have a newline — Grbl returns ok for the bare \n
+  send: (cmd: string) => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return
     const realtime = cmd === '?' || cmd === '!' || cmd === '~'
-    const data = realtime ? cmd : (cmd.endsWith('\n') ? cmd : cmd + '\n')
+    const text = realtime ? cmd : (cmd.endsWith('\n') ? cmd : cmd + '\n')
     if (cmd !== '?') addLog(set, 'tx', cmd.trim())
-    try {
-      await writer.write(new TextEncoder().encode(data))
-    } catch (err: any) {
-      addLog(set, 'error', `Send failed: ${err.message}`)
-    }
+    ws.send(JSON.stringify({ type: 'send', text }))
   },
 
   clearLog: () => set({ log: [] }),
 
-  home: async () => { await get().send('$H') },
+  home: () => { get().send('$H') },
 
-  reset: async () => {
-    if (!writer) return
+  reset: () => {
     jobActive = false
     waitingForOk = false
     set({ job: null })
-    await writer.write(new Uint8Array([0x18]))
+    rawBytes([0x18])
     addLog(set, 'tx', '[SOFT RESET]')
   },
 
-  unlock: async () => { await get().send('$X') },
+  unlock: () => { get().send('$X') },
 
   loadFile: async (file: File) => {
     const text = await file.text()
@@ -212,46 +249,40 @@ export const useGrblStore = create<GrblStore>((set, get) => ({
   pauseJob: () => {
     jobPaused = true
     set((s) => s.job ? { job: { ...s.job, paused: true } } : {})
-    if (writer) writer.write(new Uint8Array([0x21]))
+    rawBytes([0x21])
     addLog(set, 'info', 'Job paused')
   },
 
   resumeJob: () => {
     jobPaused = false
     set((s) => s.job ? { job: { ...s.job, paused: false } } : {})
-    if (writer) writer.write(new Uint8Array([0x7e]))
+    rawBytes([0x7e])
     addLog(set, 'info', 'Job resumed')
     if (!waitingForOk) sendNextJobLine(set, get)
   },
 
-  probeZ: async (plateThickness: number, feedRate: number, maxDistance: number) => {
+  probeZ: (plateThickness: number, feedRate: number, maxDistance: number) => {
     const { connected, send } = get()
     if (!connected) return
     pendingPlateThickness = plateThickness
     pendingProbeZero = false
     set({ probeResult: null, probing: true })
     addLog(set, 'info', `Probing Z — plate: ${plateThickness}mm, feed: ${feedRate}mm/min, max: ${maxDistance}mm`)
-    await send('G91')
-    await send(`G38.2 Z-${Math.abs(maxDistance)} F${feedRate}`)
+    send('G91')
+    send(`G38.2 Z-${Math.abs(maxDistance)} F${feedRate}`)
   },
 
-  spindleOverride: (byte: number) => {
-    if (writer) writer.write(new Uint8Array([byte]))
-  },
+  spindleOverride: (byte: number) => rawBytes([byte]),
 
-  feedOverride: (byte: number) => {
-    if (writer) writer.write(new Uint8Array([byte]))
-  },
+  feedOverride: (byte: number) => rawBytes([byte]),
 
   stopJob: () => {
     jobActive = false
     waitingForOk = false
     jobLines = []
     set((s) => s.job ? { job: { ...s.job, running: false, paused: false } } : {})
-    if (writer) {
-      writer.write(new Uint8Array([0x21]))
-      setTimeout(() => writer?.write(new Uint8Array([0x18])), 200)
-    }
+    rawBytes([0x21])
+    setTimeout(() => rawBytes([0x18]), 200)
     addLog(set, 'info', 'Job stopped')
   },
 }))
@@ -273,124 +304,142 @@ function sendNextJobLine(set: any, get: any) {
 
   const line = jobLines[jobIndex]
   waitingForOk = true
+  addLog(set, 'tx', line)
+  rawSend(line + '\n')
+}
 
-  if (writer) {
-    addLog(set, 'tx', line)
-    writer.write(new TextEncoder().encode(line + '\n'))
+function handleMessage(msg: any, set: any, get: any) {
+  switch (msg.type) {
+    case 'ports': {
+      const ports: string[] = msg.ports ?? []
+      set({ availablePorts: ports })
+      if (ports.length > 0 && !get().selectedPort) {
+        set({ selectedPort: ports[0] })
+      }
+      break
+    }
+
+    case 'connected': {
+      pendingFirmware = {}
+      statusInterval = setInterval(() => get().send('?'), 200)
+      addLog(set, 'info', 'Connected')
+      set({ connected: true, connecting: false, firmware: null })
+      setTimeout(() => {
+        get().send('\r\n\r\n')
+        setTimeout(() => get().send('$I'), 500)
+      }, 300)
+      break
+    }
+
+    case 'disconnected': {
+      if (statusInterval) clearInterval(statusInterval)
+      addLog(set, 'info', 'Disconnected')
+      set({ connected: false, status: null, job: null, firmware: null, gcodeState: null, probeResult: null, probing: false })
+      break
+    }
+
+    case 'error': {
+      addLog(set, 'error', msg.message ?? 'Unknown error')
+      set({ connecting: false })
+      break
+    }
+
+    case 'data': {
+      const line = (msg.text ?? '').trim()
+      if (!line) break
+      processLine(line, set, get)
+      break
+    }
   }
 }
 
-async function startReadLoop(port: SerialPort, set: any, get: any) {
-  const decoder = new TextDecoder()
-  let buffer = ''
-
-  try {
-    const reader = port.readable!.getReader()
-    while (readLoopActive) {
-      const { value, done } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true })
-      const lines = buffer.split('\n')
-      buffer = lines.pop() ?? ''
-
-      for (const raw of lines) {
-        const line = raw.trim()
-        if (!line) continue
-
-        // Status report
-        const status = parseStatus(line)
-        if (status) {
-          set({ status, alarmMessage: null })
-          continue
-        }
-
-        // GRBLHAL bracketed messages [TAG:content]
-        const bracketed = parseBracketed(line)
-        if (bracketed) {
-          if (bracketed.type === 'VER') {
-            const info = parseFirmwareVersion(bracketed.content)
-            pendingFirmware = { ...pendingFirmware, ...info }
-            set({ firmware: { version: '', date: '', isGrblHAL: false, options: '', axes: 3, ...pendingFirmware } })
-            addLog(set, 'info', `Firmware: ${bracketed.content}`)
-          } else if (bracketed.type === 'OPT') {
-            const opts = parseFirmwareOptions(bracketed.content)
-            pendingFirmware = { ...pendingFirmware, ...opts }
-            set({ firmware: { version: '', date: '', isGrblHAL: false, options: '', axes: 3, ...pendingFirmware } })
-          } else if (bracketed.type === 'PRB') {
-            const result = parseProbeResult(bracketed.content)
-            if (result) {
-              set({ probeResult: result, probing: false })
-              if (result.success) {
-                addLog(set, 'info', `Probe contact — Z machine pos: ${result.mpos.z.toFixed(3)}`)
-                pendingProbeZero = true
-              } else {
-                addLog(set, 'error', 'Probe failed — no contact within max distance')
-                get().send('G90')
-              }
-            }
-          } else if (bracketed.type === 'GC') {
-            set({ gcodeState: bracketed.content })
-          } else if (bracketed.type === 'MSG') {
-            addLog(set, 'msg', bracketed.content)
-          } else {
-            // Show other bracketed messages in terminal
-            addLog(set, 'rx', line)
-          }
-          continue
-        }
-
-        // Alarm
-        const alarm = parseAlarm(line)
-        if (alarm) {
-          jobActive = false
-          set({ alarmMessage: alarm })
-          set((s: GrblStore) => s.job ? { job: { ...s.job, running: false } } : {})
-          addLog(set, 'error', `ALARM: ${alarm}`)
-          continue
-        }
-
-        // ok — advance job stream, handle post-probe zero, or log
-        if (line === 'ok') {
-          if (pendingProbeZero) {
-            pendingProbeZero = false
-            const t = pendingPlateThickness
-            addLog(set, 'info', `Z zeroed — plate ${t}mm, retracting 5mm`)
-            get().send(`G10 L20 P0 Z${t}`)
-            get().send('G0 Z5')
-            get().send('G90')
-          } else if (jobActive && !jobPaused) {
-            jobIndex++
-            const sent = jobIndex
-            set((s: GrblStore) => s.job ? { job: { ...s.job, sent } } : {})
-            waitingForOk = false
-            sendNextJobLine(set, get)
-          } else {
-            waitingForOk = false
-            addLog(set, 'rx', 'ok')
-          }
-          continue
-        }
-
-        // error
-        const error = parseError(line)
-        if (error) {
-          if (jobActive) {
-            jobActive = false
-            waitingForOk = false
-            set((s: GrblStore) => s.job ? { job: { ...s.job, running: false } } : {})
-            addLog(set, 'error', `Job stopped — ${error}`)
-          } else {
-            addLog(set, 'error', error)
-          }
-          continue
-        }
-
-        addLog(set, 'rx', line)
-      }
-    }
-    reader.releaseLock()
-  } catch (err: any) {
-    addLog(set, 'error', `Read error: ${err.message}`)
-    get().disconnect()
+function processLine(line: string, set: any, get: any) {
+  // Status report
+  const status = parseStatus(line)
+  if (status) {
+    set({ status, alarmMessage: null })
+    return
   }
+
+  // GRBLHAL bracketed messages [TAG:content]
+  const bracketed = parseBracketed(line)
+  if (bracketed) {
+    if (bracketed.type === 'VER') {
+      const info = parseFirmwareVersion(bracketed.content)
+      pendingFirmware = { ...pendingFirmware, ...info }
+      set({ firmware: { version: '', date: '', isGrblHAL: false, options: '', axes: 3, ...pendingFirmware } })
+      addLog(set, 'info', `Firmware: ${bracketed.content}`)
+    } else if (bracketed.type === 'OPT') {
+      const opts = parseFirmwareOptions(bracketed.content)
+      pendingFirmware = { ...pendingFirmware, ...opts }
+      set({ firmware: { version: '', date: '', isGrblHAL: false, options: '', axes: 3, ...pendingFirmware } })
+    } else if (bracketed.type === 'PRB') {
+      const result = parseProbeResult(bracketed.content)
+      if (result) {
+        set({ probeResult: result, probing: false })
+        if (result.success) {
+          addLog(set, 'info', `Probe contact — Z machine pos: ${result.mpos.z.toFixed(3)}`)
+          pendingProbeZero = true
+        } else {
+          addLog(set, 'error', 'Probe failed — no contact within max distance')
+          get().send('G90')
+        }
+      }
+    } else if (bracketed.type === 'GC') {
+      set({ gcodeState: bracketed.content })
+    } else if (bracketed.type === 'MSG') {
+      addLog(set, 'msg', bracketed.content)
+    } else {
+      addLog(set, 'rx', line)
+    }
+    return
+  }
+
+  // Alarm
+  const alarm = parseAlarm(line)
+  if (alarm) {
+    jobActive = false
+    set({ alarmMessage: alarm })
+    set((s: GrblStore) => s.job ? { job: { ...s.job, running: false } } : {})
+    addLog(set, 'error', `ALARM: ${alarm}`)
+    return
+  }
+
+  // ok
+  if (line === 'ok') {
+    if (pendingProbeZero) {
+      pendingProbeZero = false
+      const t = pendingPlateThickness
+      addLog(set, 'info', `Z zeroed — plate ${t}mm, retracting 5mm`)
+      get().send(`G10 L20 P0 Z${t}`)
+      get().send('G0 Z5')
+      get().send('G90')
+    } else if (jobActive && !jobPaused) {
+      jobIndex++
+      const sent = jobIndex
+      set((s: GrblStore) => s.job ? { job: { ...s.job, sent } } : {})
+      waitingForOk = false
+      sendNextJobLine(set, get)
+    } else {
+      waitingForOk = false
+      addLog(set, 'rx', 'ok')
+    }
+    return
+  }
+
+  // error
+  const error = parseError(line)
+  if (error) {
+    if (jobActive) {
+      jobActive = false
+      waitingForOk = false
+      set((s: GrblStore) => s.job ? { job: { ...s.job, running: false } } : {})
+      addLog(set, 'error', `Job stopped — ${error}`)
+    } else {
+      addLog(set, 'error', error)
+    }
+    return
+  }
+
+  addLog(set, 'rx', line)
 }

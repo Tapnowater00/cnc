@@ -1,5 +1,6 @@
 'use client'
 
+import { useEffect } from 'react'
 import { useGrblStore } from '@/lib/grbl/store'
 import type { GrblState } from '@/lib/grbl/parser'
 
@@ -17,7 +18,14 @@ const STATE_COLORS: Record<GrblState | 'Unknown', string> = {
 }
 
 export default function StatusBar() {
-  const { connected, connecting, status, alarmMessage, firmware, connect, disconnect } = useGrblStore()
+  const {
+    connected, connecting, wsReady,
+    availablePorts, selectedPort,
+    status, alarmMessage, firmware,
+    initWs, listPorts, setSelectedPort, connect, disconnect,
+  } = useGrblStore()
+
+  useEffect(() => { initWs() }, [])
 
   const state = status?.state ?? 'Unknown'
   const pos = status?.wpos ?? { x: 0, y: 0, z: 0 }
@@ -29,7 +37,6 @@ export default function StatusBar() {
 
   return (
     <div className="bg-zinc-900 border-b border-zinc-700">
-      {/* Alarm banner */}
       {alarmMessage && (
         <div className="bg-red-900/60 border-b border-red-700 px-4 py-1.5 text-xs text-red-300 font-mono">
           ⚠ ALARM: {alarmMessage} — Send $X to unlock
@@ -65,7 +72,6 @@ export default function StatusBar() {
           </div>
         )}
 
-        {/* Spacer */}
         <div className="flex-1" />
 
         {/* Firmware badge */}
@@ -92,17 +98,43 @@ export default function StatusBar() {
           </div>
         )}
 
-        {/* Connect button */}
+        {/* Port selector + connect — only shown when not connected */}
+        {!connected && (
+          <div className="flex items-center gap-2">
+            <select
+              value={selectedPort}
+              onChange={(e) => setSelectedPort(e.target.value)}
+              className="bg-zinc-800 border border-zinc-600 text-zinc-200 text-xs rounded px-2 py-1.5 min-w-36"
+            >
+              {availablePorts.length === 0 ? (
+                <option value="">No ports found</option>
+              ) : (
+                availablePorts.map(p => (
+                  <option key={p} value={p}>{p}</option>
+                ))
+              )}
+            </select>
+            <button
+              onClick={listPorts}
+              title="Rescan ports"
+              className="px-2 py-1.5 text-xs rounded bg-zinc-700 hover:bg-zinc-600 text-zinc-300 transition-colors"
+            >
+              ↺
+            </button>
+          </div>
+        )}
+
+        {/* Connect / Disconnect button */}
         <button
           onClick={connected ? disconnect : () => connect()}
-          disabled={connecting}
+          disabled={connecting || (!connected && !wsReady)}
           className={`px-4 py-1.5 text-xs rounded font-medium transition-colors ${
             connected
               ? 'bg-red-700 hover:bg-red-600 text-white'
               : 'bg-cyan-700 hover:bg-cyan-600 text-white'
           } disabled:opacity-50`}
         >
-          {connecting ? 'Connecting...' : connected ? 'Disconnect' : 'Connect'}
+          {connecting ? 'Connecting...' : connected ? 'Disconnect' : wsReady ? 'Connect' : 'Waiting…'}
         </button>
       </div>
     </div>
