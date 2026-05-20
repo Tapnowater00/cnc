@@ -143,7 +143,7 @@ app.whenReady().then(async () => {
   tray = new Tray(icon.isEmpty() ? nativeImage.createEmpty() : icon)
   tray.setToolTip('CNC Bridge — Starting…')
 
-  const APP_URL = process.env.CNC_APP_URL ?? 'https://your-app.vercel.app'
+  const APP_URL = process.env.CNC_APP_URL ?? 'https://cnc-psi.vercel.app'
 
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: 'Starting…', enabled: false },

@@ -131,7 +131,7 @@ electron_1.app.whenReady().then(async () => {
     const icon = electron_1.nativeImage.createFromPath(iconPath);
     tray = new electron_1.Tray(icon.isEmpty() ? electron_1.nativeImage.createEmpty() : icon);
     tray.setToolTip('CNC Bridge — Starting…');
-    const APP_URL = process.env.CNC_APP_URL ?? 'https://your-app.vercel.app';
+    const APP_URL = process.env.CNC_APP_URL ?? 'https://cnc-psi.vercel.app';
     tray.setContextMenu(electron_1.Menu.buildFromTemplate([
         { label: 'Starting…', enabled: false },
         { type: 'separator' },
