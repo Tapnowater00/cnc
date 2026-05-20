@@ -24,17 +24,19 @@ export interface JobState {
   startedAt: number
 }
 
-interface GrblStore {
-  // WebSocket to the Pi bridge
-  wsReady: boolean
-  availablePorts: string[]
-  selectedPort: string
+// webserial  → Chrome/Edge hosted: browser native serial, no bridge app needed
+// websocket  → Pi/local server or Firefox/Safari hosted: WebSocket bridge
+type ConnectionMode = 'webserial' | 'websocket' | null
 
-  // Serial connection
+interface GrblStore {
+  connectionMode: ConnectionMode
+  bridgeReady: boolean       // Web Serial: always true; WebSocket: true when WS is open
+  availablePorts: string[]   // WebSocket mode only
+  selectedPort: string       // WebSocket mode only
+
   connected: boolean
   connecting: boolean
 
-  // Machine state
   status: GrblStatus | null
   alarmMessage: string | null
   firmware: FirmwareInfo | null
@@ -42,14 +44,10 @@ interface GrblStore {
   probeResult: ProbeResult | null
   probing: boolean
 
-  // Terminal log
   log: LogEntry[]
-
-  // Job streaming
   job: JobState | null
 
-  // Actions
-  initWs: () => void
+  initBridge: () => void
   listPorts: () => void
   setSelectedPort: (port: string) => void
   connect: (baudRate?: number) => void
@@ -60,71 +58,73 @@ interface GrblStore {
   reset: () => void
   unlock: () => void
 
-  // Job actions
   loadFile: (file: File) => Promise<void>
   startJob: () => void
   pauseJob: () => void
   resumeJob: () => void
   stopJob: () => void
 
-  // Probe actions
   probeZ: (plateThickness: number, feedRate: number, maxDistance: number) => void
-
-  // Spindle + override actions
   spindleOverride: (byte: number) => void
   feedOverride: (byte: number) => void
 }
 
+// ── Module-level transport state ─────────────────────────────────────────────
+
 let logId = 0
 let ws: WebSocket | null = null
+let writer: WritableStreamDefaultWriter<Uint8Array> | null = null
+let serialReadActive = false
 let statusInterval: ReturnType<typeof setInterval> | null = null
 
-// Job streaming state
 let jobLines: string[] = []
 let jobIndex = 0
 let jobActive = false
 let jobPaused = false
 let waitingForOk = false
 
-// Accumulated firmware info from [VER] + [OPT]
 let pendingFirmware: Partial<FirmwareInfo> = {}
-
-// Post-probe state
 let pendingProbeZero = false
 let pendingPlateThickness = 15
 
-// Hosted webapp (Vercel etc.) → local bridge on 3001
-// Pi / local dev → same host as the page
+// ── Transport helpers (work for both modes) ──────────────────────────────────
+
+function rawSend(text: string) {
+  if (writer) {
+    writer.write(new TextEncoder().encode(text)).catch(() => {})
+  } else if (ws?.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'send', text }))
+  }
+}
+
+function rawBytes(data: number[]) {
+  if (writer) {
+    writer.write(new Uint8Array(data)).catch(() => {})
+  } else if (ws?.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'bytes', data }))
+  }
+}
+
+// Hosted (non-LAN) URL → ws://localhost:3001; local/Pi → same host
 function resolveWsUrl(): string {
   if (typeof window === 'undefined') return 'ws://localhost:3000/ws'
-  const hostname = window.location.hostname
-  const isLocalNetwork =
-    hostname === 'localhost' ||
-    hostname === '127.0.0.1' ||
-    /^192\.168\./.test(hostname) ||
-    /^10\./.test(hostname) ||
-    /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(hostname)
-  if (isLocalNetwork) {
+  const h = window.location.hostname
+  const isLocal =
+    h === 'localhost' || h === '127.0.0.1' ||
+    /^192\.168\./.test(h) || /^10\./.test(h) ||
+    /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(h)
+  if (isLocal) {
     const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
     return `${proto}//${window.location.host}/ws`
   }
   return 'ws://localhost:3001/ws'
 }
 
-function rawSend(text: string) {
-  if (ws?.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: 'send', text }))
-  }
-}
-
-function rawBytes(data: number[]) {
-  if (ws?.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: 'bytes', data }))
-  }
-}
+// ── Store ────────────────────────────────────────────────────────────────────
 
 export const useGrblStore = create<GrblStore>((set, get) => ({
-  wsReady: false,
+  connectionMode: null,
+  bridgeReady: false,
   availablePorts: [],
   selectedPort: '',
   connected: false,
@@ -138,57 +138,86 @@ export const useGrblStore = create<GrblStore>((set, get) => ({
   log: [],
   job: null,
 
-  initWs: () => {
+  initBridge: () => {
+    if (typeof window === 'undefined') return
+
+    // Hosted URL + Web Serial available → no bridge app needed
+    const h = window.location.hostname
+    const isLocal =
+      h === 'localhost' || h === '127.0.0.1' ||
+      /^192\.168\./.test(h) || /^10\./.test(h) ||
+      /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(h)
+
+    if (!isLocal && 'serial' in navigator) {
+      set({ connectionMode: 'webserial', bridgeReady: true })
+      return
+    }
+
+    // Pi / local server / Firefox / Safari → WebSocket bridge
     if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return
     ws = new WebSocket(resolveWsUrl())
 
     ws.onopen = () => {
-      set({ wsReady: true })
+      set({ connectionMode: 'websocket', bridgeReady: true })
       get().listPorts()
     }
-
     ws.onclose = () => {
-      set({ wsReady: false })
+      set({ bridgeReady: false })
       if (get().connected) {
         addLog(set, 'error', 'Bridge connection lost')
         if (statusInterval) clearInterval(statusInterval)
         set({ connected: false, status: null, job: null })
       }
     }
-
     ws.onerror = () => {
-      addLog(set, 'error', 'WebSocket error — is the server running?')
+      addLog(set, 'error', 'WebSocket error — is the bridge running?')
+      set({ connectionMode: 'websocket' })
     }
-
     ws.onmessage = (event: MessageEvent) => {
-      let msg: { type: string; ports?: string[]; text?: string; message?: string }
-      try {
-        msg = JSON.parse(event.data)
-      } catch {
-        return
-      }
-      handleMessage(msg, set, get)
+      let msg: any
+      try { msg = JSON.parse(event.data) } catch { return }
+      handleWsMessage(msg, set, get)
     }
   },
 
   listPorts: () => {
-    if (ws?.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'ports' }))
-    }
+    if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'ports' }))
   },
 
-  setSelectedPort: (port: string) => set({ selectedPort: port }),
+  setSelectedPort: (port) => set({ selectedPort: port }),
 
   connect: (baudRate = 115200) => {
-    const { selectedPort, wsReady, initWs } = get()
-    if (!wsReady) {
-      initWs()
+    const { connectionMode, selectedPort, bridgeReady, initBridge } = get()
+
+    if (!bridgeReady) { initBridge(); return }
+
+    if (connectionMode === 'webserial') {
+      set({ connecting: true })
+      ;(async () => {
+        try {
+          const port = await (navigator as any).serial.requestPort()
+          await port.open({ baudRate })
+          writer = port.writable.getWriter()
+          serialReadActive = true
+          pendingFirmware = {}
+          startSerialReadLoop(port, set, get)
+          statusInterval = setInterval(() => get().send('?'), 200)
+          addLog(set, 'info', 'Connected')
+          set({ connected: true, connecting: false, firmware: null })
+          setTimeout(() => {
+            get().send('\r\n\r\n')
+            setTimeout(() => get().send('$I'), 500)
+          }, 300)
+        } catch (err: any) {
+          addLog(set, 'error', `Connection failed: ${err.message}`)
+          set({ connecting: false })
+        }
+      })()
       return
     }
-    if (!selectedPort) {
-      addLog(set, 'error', 'No port selected')
-      return
-    }
+
+    // WebSocket path
+    if (!selectedPort) { addLog(set, 'error', 'No port selected'); return }
     set({ connecting: true })
     ws?.send(JSON.stringify({ type: 'connect', port: selectedPort, baudRate }))
   },
@@ -196,21 +225,27 @@ export const useGrblStore = create<GrblStore>((set, get) => ({
   disconnect: () => {
     jobActive = false
     if (statusInterval) clearInterval(statusInterval)
-    ws?.send(JSON.stringify({ type: 'disconnect' }))
+
+    if (writer) {
+      serialReadActive = false
+      writer.releaseLock()
+      writer = null
+    } else {
+      ws?.send(JSON.stringify({ type: 'disconnect' }))
+    }
+
     addLog(set, 'info', 'Disconnected')
     set({ connected: false, status: null, job: null, firmware: null, gcodeState: null, probeResult: null, probing: false })
   },
 
   send: (cmd: string) => {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return
     const realtime = cmd === '?' || cmd === '!' || cmd === '~'
     const text = realtime ? cmd : (cmd.endsWith('\n') ? cmd : cmd + '\n')
     if (cmd !== '?') addLog(set, 'tx', cmd.trim())
-    ws.send(JSON.stringify({ type: 'send', text }))
+    rawSend(text)
   },
 
   clearLog: () => set({ log: [] }),
-
   home: () => { get().send('$H') },
 
   reset: () => {
@@ -227,36 +262,20 @@ export const useGrblStore = create<GrblStore>((set, get) => ({
     const text = await file.text()
     const lines = text
       .split('\n')
-      .map(l => {
-        const stripped = l.replace(/\(.*?\)/g, '').replace(/;.*$/, '').trim()
-        return stripped.toUpperCase()
-      })
+      .map(l => l.replace(/\(.*?\)/g, '').replace(/;.*$/, '').trim().toUpperCase())
       .filter(l => l.length > 0 && l !== '%')
-
-    set({
-      job: {
-        filename: file.name,
-        lines,
-        total: lines.length,
-        sent: 0,
-        running: false,
-        paused: false,
-        startedAt: 0,
-      },
-    })
+    set({ job: { filename: file.name, lines, total: lines.length, sent: 0, running: false, paused: false, startedAt: 0 } })
     addLog(set, 'info', `Loaded: ${file.name} (${lines.length} lines)`)
   },
 
   startJob: () => {
     const { job, connected } = get()
     if (!job || !connected) return
-
     jobLines = job.lines
     jobIndex = 0
     jobActive = true
     jobPaused = false
     waitingForOk = false
-
     set({ job: { ...job, running: true, paused: false, sent: 0, startedAt: Date.now() } })
     addLog(set, 'info', `Job started: ${job.filename}`)
     sendNextJobLine(set, get)
@@ -277,20 +296,18 @@ export const useGrblStore = create<GrblStore>((set, get) => ({
     if (!waitingForOk) sendNextJobLine(set, get)
   },
 
-  probeZ: (plateThickness: number, feedRate: number, maxDistance: number) => {
-    const { connected, send } = get()
-    if (!connected) return
+  probeZ: (plateThickness, feedRate, maxDistance) => {
+    if (!get().connected) return
     pendingPlateThickness = plateThickness
     pendingProbeZero = false
     set({ probeResult: null, probing: true })
     addLog(set, 'info', `Probing Z — plate: ${plateThickness}mm, feed: ${feedRate}mm/min, max: ${maxDistance}mm`)
-    send('G91')
-    send(`G38.2 Z-${Math.abs(maxDistance)} F${feedRate}`)
+    get().send('G91')
+    get().send(`G38.2 Z-${Math.abs(maxDistance)} F${feedRate}`)
   },
 
-  spindleOverride: (byte: number) => rawBytes([byte]),
-
-  feedOverride: (byte: number) => rawBytes([byte]),
+  spindleOverride: (byte) => rawBytes([byte]),
+  feedOverride: (byte) => rawBytes([byte]),
 
   stopJob: () => {
     jobActive = false
@@ -302,6 +319,8 @@ export const useGrblStore = create<GrblStore>((set, get) => ({
     addLog(set, 'info', 'Job stopped')
   },
 }))
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
 function addLog(set: any, direction: LogEntry['direction'], text: string) {
   set((s: GrblStore) => ({
@@ -317,67 +336,16 @@ function sendNextJobLine(set: any, get: any) {
     addLog(set, 'info', 'Job complete!')
     return
   }
-
   const line = jobLines[jobIndex]
   waitingForOk = true
   addLog(set, 'tx', line)
   rawSend(line + '\n')
 }
 
-function handleMessage(msg: any, set: any, get: any) {
-  switch (msg.type) {
-    case 'ports': {
-      const ports: string[] = msg.ports ?? []
-      set({ availablePorts: ports })
-      if (ports.length > 0 && !get().selectedPort) {
-        set({ selectedPort: ports[0] })
-      }
-      break
-    }
-
-    case 'connected': {
-      pendingFirmware = {}
-      statusInterval = setInterval(() => get().send('?'), 200)
-      addLog(set, 'info', 'Connected')
-      set({ connected: true, connecting: false, firmware: null })
-      setTimeout(() => {
-        get().send('\r\n\r\n')
-        setTimeout(() => get().send('$I'), 500)
-      }, 300)
-      break
-    }
-
-    case 'disconnected': {
-      if (statusInterval) clearInterval(statusInterval)
-      addLog(set, 'info', 'Disconnected')
-      set({ connected: false, status: null, job: null, firmware: null, gcodeState: null, probeResult: null, probing: false })
-      break
-    }
-
-    case 'error': {
-      addLog(set, 'error', msg.message ?? 'Unknown error')
-      set({ connecting: false })
-      break
-    }
-
-    case 'data': {
-      const line = (msg.text ?? '').trim()
-      if (!line) break
-      processLine(line, set, get)
-      break
-    }
-  }
-}
-
 function processLine(line: string, set: any, get: any) {
-  // Status report
   const status = parseStatus(line)
-  if (status) {
-    set({ status, alarmMessage: null })
-    return
-  }
+  if (status) { set({ status, alarmMessage: null }); return }
 
-  // GRBLHAL bracketed messages [TAG:content]
   const bracketed = parseBracketed(line)
   if (bracketed) {
     if (bracketed.type === 'VER') {
@@ -411,7 +379,6 @@ function processLine(line: string, set: any, get: any) {
     return
   }
 
-  // Alarm
   const alarm = parseAlarm(line)
   if (alarm) {
     jobActive = false
@@ -421,7 +388,6 @@ function processLine(line: string, set: any, get: any) {
     return
   }
 
-  // ok
   if (line === 'ok') {
     if (pendingProbeZero) {
       pendingProbeZero = false
@@ -432,8 +398,7 @@ function processLine(line: string, set: any, get: any) {
       get().send('G90')
     } else if (jobActive && !jobPaused) {
       jobIndex++
-      const sent = jobIndex
-      set((s: GrblStore) => s.job ? { job: { ...s.job, sent } } : {})
+      set((s: GrblStore) => s.job ? { job: { ...s.job, sent: jobIndex } } : {})
       waitingForOk = false
       sendNextJobLine(set, get)
     } else {
@@ -443,7 +408,6 @@ function processLine(line: string, set: any, get: any) {
     return
   }
 
-  // error
   const error = parseError(line)
   if (error) {
     if (jobActive) {
@@ -458,4 +422,68 @@ function processLine(line: string, set: any, get: any) {
   }
 
   addLog(set, 'rx', line)
+}
+
+// Web Serial read loop — feeds the same processLine used by WebSocket path
+async function startSerialReadLoop(port: any, set: any, get: any) {
+  const decoder = new TextDecoder()
+  let buffer = ''
+  try {
+    const reader = port.readable!.getReader()
+    while (serialReadActive) {
+      const { value, done } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() ?? ''
+      for (const raw of lines) {
+        const line = raw.trim()
+        if (line) processLine(line, set, get)
+      }
+    }
+    reader.releaseLock()
+    try { await port.close() } catch {}
+  } catch (err: any) {
+    addLog(set, 'error', `Read error: ${err.message}`)
+    get().disconnect()
+  }
+}
+
+// WebSocket message handler
+function handleWsMessage(msg: any, set: any, get: any) {
+  switch (msg.type) {
+    case 'ports': {
+      const ports: string[] = msg.ports ?? []
+      set({ availablePorts: ports })
+      if (ports.length > 0 && !get().selectedPort) set({ selectedPort: ports[0] })
+      break
+    }
+    case 'connected': {
+      pendingFirmware = {}
+      statusInterval = setInterval(() => get().send('?'), 200)
+      addLog(set, 'info', 'Connected')
+      set({ connected: true, connecting: false, firmware: null })
+      setTimeout(() => {
+        get().send('\r\n\r\n')
+        setTimeout(() => get().send('$I'), 500)
+      }, 300)
+      break
+    }
+    case 'disconnected': {
+      if (statusInterval) clearInterval(statusInterval)
+      addLog(set, 'info', 'Disconnected')
+      set({ connected: false, status: null, job: null, firmware: null, gcodeState: null, probeResult: null, probing: false })
+      break
+    }
+    case 'error': {
+      addLog(set, 'error', msg.message ?? 'Unknown error')
+      set({ connecting: false })
+      break
+    }
+    case 'data': {
+      const line = (msg.text ?? '').trim()
+      if (line) processLine(line, set, get)
+      break
+    }
+  }
 }

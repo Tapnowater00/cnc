@@ -19,21 +19,27 @@ const STATE_COLORS: Record<GrblState | 'Unknown', string> = {
 
 export default function StatusBar() {
   const {
-    connected, connecting, wsReady,
+    connected, connecting, bridgeReady, connectionMode,
     availablePorts, selectedPort,
     status, alarmMessage, firmware,
-    initWs, listPorts, setSelectedPort, connect, disconnect,
+    initBridge, listPorts, setSelectedPort, connect, disconnect,
   } = useGrblStore()
 
-  useEffect(() => { initWs() }, [])
+  useEffect(() => { initBridge() }, [])
 
   const state = status?.state ?? 'Unknown'
-  const pos = status?.wpos ?? { x: 0, y: 0, z: 0 }
-  const mpos = status?.mpos ?? { x: 0, y: 0, z: 0 }
-  const pins = status?.pins
-  const fs = status ? `${status.feed} mm/min  S${status.spindle}` : '—'
+  const pos   = status?.wpos ?? { x: 0, y: 0, z: 0 }
+  const mpos  = status?.mpos ?? { x: 0, y: 0, z: 0 }
+  const pins  = status?.pins
+  const fs    = status ? `${status.feed} mm/min  S${status.spindle}` : '—'
+  const fmt   = (n: number) => n.toFixed(3).padStart(8)
 
-  const fmt = (n: number) => n.toFixed(3).padStart(8)
+  const showPortPicker = !connected && connectionMode === 'websocket'
+
+  let connectLabel = 'Connect'
+  if (connecting) connectLabel = 'Connecting...'
+  else if (connected) connectLabel = 'Disconnect'
+  else if (!bridgeReady) connectLabel = 'Waiting…'
 
   return (
     <div className="bg-zinc-900 border-b border-zinc-700">
@@ -57,18 +63,16 @@ export default function StatusBar() {
         </div>
 
         {/* Feed + spindle */}
-        {status && (
-          <div className="text-xs text-zinc-400 font-mono">{fs}</div>
-        )}
+        {status && <div className="text-xs text-zinc-400 font-mono">{fs}</div>}
 
         {/* Pins */}
         {pins && (
           <div className="flex gap-1">
-            <Pin label="X" active={pins.x} title="X limit" />
-            <Pin label="Y" active={pins.y} title="Y limit" />
-            <Pin label="Z" active={pins.z} title="Z limit" />
-            <Pin label="P" active={pins.probe} title="Probe" color="yellow" />
-            <Pin label="E" active={pins.estop} title="E-Stop" color="red" />
+            <Pin label="X" active={pins.x}     title="X limit" />
+            <Pin label="Y" active={pins.y}     title="Y limit" />
+            <Pin label="Z" active={pins.z}     title="Z limit" />
+            <Pin label="P" active={pins.probe} title="Probe"   color="yellow" />
+            <Pin label="E" active={pins.estop} title="E-Stop"  color="red" />
           </div>
         )}
 
@@ -98,21 +102,18 @@ export default function StatusBar() {
           </div>
         )}
 
-        {/* Port selector + connect — only shown when not connected */}
-        {!connected && (
+        {/* Port selector — WebSocket mode only (Web Serial uses the browser's own picker) */}
+        {showPortPicker && (
           <div className="flex items-center gap-2">
             <select
               value={selectedPort}
               onChange={(e) => setSelectedPort(e.target.value)}
               className="bg-zinc-800 border border-zinc-600 text-zinc-200 text-xs rounded px-2 py-1.5 min-w-36"
             >
-              {availablePorts.length === 0 ? (
-                <option value="">No ports found</option>
-              ) : (
-                availablePorts.map(p => (
-                  <option key={p} value={p}>{p}</option>
-                ))
-              )}
+              {availablePorts.length === 0
+                ? <option value="">No ports found</option>
+                : availablePorts.map(p => <option key={p} value={p}>{p}</option>)
+              }
             </select>
             <button
               onClick={listPorts}
@@ -124,17 +125,17 @@ export default function StatusBar() {
           </div>
         )}
 
-        {/* Connect / Disconnect button */}
+        {/* Connect / Disconnect */}
         <button
           onClick={connected ? disconnect : () => connect()}
-          disabled={connecting || (!connected && !wsReady)}
+          disabled={connecting || (!connected && !bridgeReady)}
           className={`px-4 py-1.5 text-xs rounded font-medium transition-colors ${
             connected
               ? 'bg-red-700 hover:bg-red-600 text-white'
               : 'bg-cyan-700 hover:bg-cyan-600 text-white'
           } disabled:opacity-50`}
         >
-          {connecting ? 'Connecting...' : connected ? 'Disconnect' : wsReady ? 'Connect' : 'Waiting…'}
+          {connectLabel}
         </button>
       </div>
     </div>
@@ -150,12 +151,16 @@ function Axis({ label, value }: { label: string; value: string }) {
   )
 }
 
-function Pin({ label, active, title, color = 'red' }: { label: string; active: boolean; title: string; color?: string }) {
+function Pin({ label, active, title, color = 'red' }: {
+  label: string; active: boolean; title: string; color?: string
+}) {
   const activeColor = color === 'yellow' ? 'bg-yellow-500 text-black' : 'bg-red-500 text-white'
   return (
     <div
       title={title}
-      className={`w-5 h-5 rounded text-[10px] font-bold flex items-center justify-center transition-colors ${active ? activeColor : 'bg-zinc-700 text-zinc-600'}`}
+      className={`w-5 h-5 rounded text-[10px] font-bold flex items-center justify-center transition-colors ${
+        active ? activeColor : 'bg-zinc-700 text-zinc-600'
+      }`}
     >
       {label}
     </div>
