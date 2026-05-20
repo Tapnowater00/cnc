@@ -2,11 +2,15 @@
   "name": "cnc-easel",
   "version": "0.1.0",
   "private": true,
+  "main": "electron/main.js",
   "scripts": {
     "dev": "tsx watch server.ts",
     "build": "next build",
     "start": "NODE_ENV=production tsx server.ts",
-    "lint": "eslint"
+    "lint": "eslint",
+    "bridge:compile": "tsc -p electron/tsconfig.json",
+    "bridge:dev": "npm run bridge:compile && electron .",
+    "bridge:dist": "npm run bridge:compile && electron-builder"
   },
   "dependencies": {
     "@react-three/drei": "^10.7.7",
@@ -31,10 +35,38 @@
     "@types/react-dom": "^19",
     "@types/wicg-file-system-access": "^2023.10.7",
     "@types/ws": "^8.5.0",
+    "electron": "^33.0.0",
+    "electron-builder": "^25.0.0",
     "eslint": "^9",
     "eslint-config-next": "16.2.6",
     "tailwindcss": "^4",
     "tsx": "^4.19.0",
     "typescript": "^5"
+  },
+  "build": {
+    "appId": "com.tapnowater00.cnc-bridge",
+    "productName": "CNC Bridge",
+    "copyright": "Tapnowater00",
+    "asar": false,
+    "files": [
+      "electron/main.js",
+      "package.json",
+      "node_modules/**"
+    ],
+    "extraMetadata": {
+      "main": "electron/main.js"
+    },
+    "win": {
+      "target": "portable",
+      "icon": "public/favicon.ico"
+    },
+    "mac": {
+      "target": "dmg",
+      "icon": "public/favicon.ico"
+    },
+    "linux": {
+      "target": "AppImage",
+      "icon": "public/favicon.ico"
+    }
   }
 }

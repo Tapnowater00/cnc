@@ -93,6 +93,24 @@ let pendingFirmware: Partial<FirmwareInfo> = {}
 let pendingProbeZero = false
 let pendingPlateThickness = 15
 
+// Hosted webapp (Vercel etc.) → local bridge on 3001
+// Pi / local dev → same host as the page
+function resolveWsUrl(): string {
+  if (typeof window === 'undefined') return 'ws://localhost:3000/ws'
+  const hostname = window.location.hostname
+  const isLocalNetwork =
+    hostname === 'localhost' ||
+    hostname === '127.0.0.1' ||
+    /^192\.168\./.test(hostname) ||
+    /^10\./.test(hostname) ||
+    /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(hostname)
+  if (isLocalNetwork) {
+    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    return `${proto}//${window.location.host}/ws`
+  }
+  return 'ws://localhost:3001/ws'
+}
+
 function rawSend(text: string) {
   if (ws?.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: 'send', text }))
@@ -122,9 +140,7 @@ export const useGrblStore = create<GrblStore>((set, get) => ({
 
   initWs: () => {
     if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return
-    const proto = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const host = typeof window !== 'undefined' ? window.location.host : 'localhost:3000'
-    ws = new WebSocket(`${proto}//${host}/ws`)
+    ws = new WebSocket(resolveWsUrl())
 
     ws.onopen = () => {
       set({ wsReady: true })
