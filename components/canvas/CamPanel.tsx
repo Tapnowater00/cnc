@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useCanvasStore, DEFAULT_CUT_SETTINGS } from '@/lib/canvas/store'
 import type { ShapeCutSettings, CutType, CutMode, PocketStrategy } from '@/lib/canvas/store'
 import { generateProfile } from '@/lib/cam/profile'
@@ -19,13 +19,9 @@ export default function CamPanel() {
 
   // Per-shape gcode preview state (not persisted — regenerate to refresh)
   const [generated, setGenerated] = useState<string[] | null>(null)
-  const [lastShapeId, setLastShapeId] = useState<string | null>(null)
 
   // Clear preview when selection changes
-  if (selected?.id !== lastShapeId) {
-    setLastShapeId(selected?.id ?? null)
-    if (generated !== null) setGenerated(null)
-  }
+  useEffect(() => { setGenerated(null) }, [selectedId])
 
   // ── No shape selected ─────────────────────────────────────────
   if (!selected) {
